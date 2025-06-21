@@ -1,0 +1,106 @@
+import time
+import math
+import requests
+import pandas as pd
+from openpyxl import Workbook
+from tqdm import tqdm
+
+# === CONFIGURATION === #
+KEEPA_API_KEY = 'aja9g1k52mr0co8l8h3csj64io1slb3j7t6se1ic5taar1skedktm3pa95qb5862'
+INPUT_EXCEL = 'KeepaExport-2025-ProductFinder.xlsx'
+OUTPUT_EXCEL = 'EnrichedAffiliateSheet_Test10.xlsx'
+ASINS_PER_REQUEST = 10
+INITIAL_TOKENS = 1260
+TOKEN_RECOVERY_RATE_PER_MIN = 20
+TOKEN_RECOVERY_INTERVAL_SEC = 3
+
+# === LOAD ASINS === #
+df_input = pd.read_excel(INPUT_EXCEL)
+asin_list = df_input['ASIN'].dropna().astype(str).tolist()[:10]  # First 10 ASINs for test
+
+# === TOKEN MANAGEMENT === #
+available_tokens = INITIAL_TOKENS
+last_token_time = time.time()
+
+def wait_for_tokens(required):
+    global available_tokens, last_token_time
+    while available_tokens < required:
+        now = time.time()
+        elapsed = now - last_token_time
+        recovered = int(elapsed / TOKEN_RECOVERY_INTERVAL_SEC)
+        if recovered > 0:
+            available_tokens = min(1260, available_tokens + recovered)
+            last_token_time += recovered * TOKEN_RECOVERY_INTERVAL_SEC
+        if available_tokens < required:
+            time.sleep(1)
+    available_tokens -= required
+
+# === HELPER FUNCTIONS === #
+def get_commission_tier(referral_fee_percent):
+    if referral_fee_percent is None:
+        return 'Tier 4'
+    if referral_fee_percent >= 12:
+        return 'Tier 1'
+    elif referral_fee_percent >= 8:
+        return 'Tier 2'
+    elif referral_fee_percent >= 5:
+        return 'Tier 3'
+    else:
+        return 'Tier 4'
+
+def extract_product_info(product):
+    asin = product.get('asin')
+    title = product.get('title')
+    url = f'https://www.amazon.co.jp/dp/{asin}'
+    stats = product.get('stats', {})
+
+    buy_box_price = stats.get("buyBoxPrice")
+    if isinstance(buy_box_price, list):
+        buy_box_price = buy_box_price[-1] / 100 if buy_box_price[-1] else None
+    else:
+        buy_box_price = buy_box_price / 100 if buy_box_price else None
+
+    referral_fee_percent = product.get("refFee")
+    commission_tier = get_commission_tier(referral_fee_percent)
+
+    return {
+        "ASIN": asin,
+        "Title": title,
+        "Buy Box Price (\u00a5)": buy_box_price,
+        "Referral Fee %": referral_fee_percent,
+        "Commission Tier": commission_tier,
+        "URL": url
+    }
+
+# === MAIN API CALL === #
+def fetch_keepa_data(asin_batch):
+    joined_asins = ','.join(asin_batch)
+    url = f'https://api.keepa.com/product?key={KEEPA_API_KEY}&domain=5&asin={joined_asins}&stats=180'
+    wait_for_tokens(len(asin_batch))
+    response = requests.get(url)
+    if response.status_code == 200:
+        data = response.json()
+        return data.get("products", [])
+    else:
+        print(f"Error fetching data: {response.status_code}")
+        return []
+
+# === PROCESSING === #
+all_results = []
+print("\nProcessing...")
+for i in tqdm(range(0, len(asin_list), ASINS_PER_REQUEST)):
+    batch = asin_list[i:i + ASINS_PER_REQUEST]
+    products = fetch_keepa_data(batch)
+    for product in products:
+        if product is not None:
+            try:
+                all_results.append(extract_product_info(product))
+            except Exception as e:
+                print(f"Failed to process ASIN {product.get('asin')}: {e}")
+        else:
+            print("Product returned as None, skipping.")
+
+# === SAVE TO EXCEL === #
+df_output = pd.DataFrame(all_results)
+df_output.to_excel(OUTPUT_EXCEL, index=False)
+print(f"\n✅ Done. Results saved to {OUTPUT_EXCEL}")
